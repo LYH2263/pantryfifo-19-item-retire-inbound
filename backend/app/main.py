@@ -4,7 +4,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from app import seed
-from app.db import connect
+from app.db import connect, connect_tx
 from app.engines.fefo import consume_fefo, expire_lots
 
 app = FastAPI(title="Pantryfifo", version="0.1.0")
@@ -17,13 +17,47 @@ def _startup(): seed.init_db()
 def health(): return {"ok": True, "project": "pantryfifo"}
 
 @app.get("/api/items")
-def items():
-    c = connect(); rows = [dict(r) for r in c.execute("SELECT * FROM items")]; c.close(); return rows
+def items(active: int | None = None):
+    c = connect()
+    q = "SELECT * FROM items"
+    args = []
+    if active is not None:
+        q += " WHERE active=?"; args.append(active)
+    rows = [dict(r) for r in c.execute(q, args)]; c.close(); return rows
+
+class StatusIn(BaseModel):
+    active: int
+
+@app.post("/api/items/{item_id}/status")
+def set_item_status(item_id: int, body: StatusIn):
+    # single atomic UPDATE: only flips items.active, never rewrites lots
+    if body.active not in (0, 1):
+        raise HTTPException(400, "active_must_be_0_or_1")
+    c = connect()
+    cur = c.execute("UPDATE items SET active=? WHERE id=?", (body.active, item_id))
+    if cur.rowcount != 1:
+        c.close(); raise HTTPException(404, "item")
+    c.commit()
+    row = dict(c.execute("SELECT * FROM items WHERE id=?", (item_id,)).fetchone())
+    c.close(); return row
+
+@app.get("/api/items/{item_id}/deactivate-preview")
+def deactivate_preview(item_id: int):
+    # read-only impact summary for the confirm dialog; shelf state is untouched
+    c = connect()
+    item = c.execute("SELECT * FROM items WHERE id=?", (item_id,)).fetchone()
+    if not item:
+        c.close(); raise HTTPException(404, "item")
+    agg = c.execute(
+        """SELECT COUNT(*) n, COALESCE(SUM(qty_remain),0) qty FROM lots
+           WHERE item_id=? AND status='on_shelf' AND qty_remain>0""", (item_id,)).fetchone()
+    c.close()
+    return {"item": dict(item), "on_shelf_lots": agg["n"], "on_shelf_qty": agg["qty"]}
 
 @app.get("/api/fridge")
 def fridge(layer: str | None = None):
     c = connect()
-    q = """SELECT lots.*, items.name, items.layer, items.unit FROM lots
+    q = """SELECT lots.*, items.name, items.layer, items.unit, items.active FROM lots
            JOIN items ON items.id=lots.item_id WHERE lots.status='on_shelf'"""
     args = []
     if layer:
@@ -58,13 +92,23 @@ class LotIn(BaseModel):
 
 @app.post("/api/lots")
 def inbound(body: LotIn):
-    c = connect()
-    item = c.execute("SELECT id FROM items WHERE id=?", (body.item_id,)).fetchone()
-    if not item: c.close(); raise HTTPException(404, "item")
-    cur = c.execute(
-        "INSERT INTO lots(item_id,qty_in,qty_remain,expiry,status,data_quality) VALUES (?,?,?,?,?,?)",
-        (body.item_id, body.qty, body.qty, body.expiry, "on_shelf", "clean"))
-    c.commit(); lid = cur.lastrowid; c.close(); return {"id": lid}
+    # confirm-time gate: any pre-issued inbound form fails here once the item is
+    # deactivated, so lots never gain a row the dropdown no longer offers
+    c = connect_tx()
+    try:
+        c.execute("BEGIN IMMEDIATE")
+        item = c.execute("SELECT id, active FROM items WHERE id=?", (body.item_id,)).fetchone()
+        if not item:
+            c.execute("ROLLBACK"); raise HTTPException(404, "item")
+        if not item["active"]:
+            c.execute("ROLLBACK"); raise HTTPException(409, "item_inactive")
+        cur = c.execute(
+            "INSERT INTO lots(item_id,qty_in,qty_remain,expiry,status,data_quality) VALUES (?,?,?,?,?,?)",
+            (body.item_id, body.qty, body.qty, body.expiry, "on_shelf", "clean"))
+        c.execute("COMMIT")
+        return {"id": cur.lastrowid}
+    finally:
+        c.close()
 
 class ConsumeIn(BaseModel):
     item_id: int
@@ -73,22 +117,34 @@ class ConsumeIn(BaseModel):
 
 @app.post("/api/consume")
 def consume(body: ConsumeIn):
-    c = connect()
-    lots = [dict(r) for r in c.execute(
-        "SELECT * FROM lots WHERE item_id=? AND status='on_shelf' AND qty_remain>0", (body.item_id,))]
-    result = consume_fefo(lots, body.qty)
-    if not result["ok"] and result["reason"] == "qty_non_positive":
-        c.close(); raise HTTPException(400, result["reason"])
-    if not result["ok"]:
-        c.close(); raise HTTPException(409, result)
-    for d in result["deductions"]:
-        c.execute("UPDATE lots SET qty_remain = qty_remain - ? WHERE id=?", (d["take"], d["lot_id"]))
-        rem = c.execute("SELECT qty_remain FROM lots WHERE id=?", (d["lot_id"],)).fetchone()["qty_remain"]
-        if rem <= 0:
-            c.execute("UPDATE lots SET status='consumed', qty_remain=0 WHERE id=?", (d["lot_id"],))
-    c.execute("INSERT INTO consumptions(note,result_json,created_at) VALUES (?,?,?)",
-              (body.note, json.dumps(result), datetime.now(timezone.utc).isoformat()))
-    c.commit(); c.close(); return result
+    # one write-locked transaction: deduct to zero or fail the whole order with
+    # shelf quantities untouched; deactivation serializes against the same lock
+    c = connect_tx()
+    try:
+        c.execute("BEGIN IMMEDIATE")
+        lots = [dict(r) for r in c.execute(
+            "SELECT * FROM lots WHERE item_id=? AND status='on_shelf' AND qty_remain>0", (body.item_id,))]
+        result = consume_fefo(lots, body.qty)
+        if not result["ok"] and result["reason"] == "qty_non_positive":
+            c.execute("ROLLBACK"); raise HTTPException(400, result["reason"])
+        if not result["ok"]:
+            c.execute("ROLLBACK"); raise HTTPException(409, result)
+        remain_by_id = {l["id"]: float(l["qty_remain"]) for l in lots}
+        for d in result["deductions"]:
+            cur = c.execute(
+                "UPDATE lots SET qty_remain = qty_remain - ? WHERE id=? AND qty_remain >= ?",
+                (d["take"], d["lot_id"], d["take"]))
+            if cur.rowcount != 1:
+                c.execute("ROLLBACK")
+                raise HTTPException(409, {"ok": False, "reason": "concurrent_update", "deductions": [], "short": 0.0})
+            if remain_by_id.get(d["lot_id"], 0.0) - d["take"] <= 1e-9:
+                c.execute("UPDATE lots SET status='consumed', qty_remain=0 WHERE id=?", (d["lot_id"],))
+        c.execute("INSERT INTO consumptions(note,result_json,created_at) VALUES (?,?,?)",
+                  (body.note, json.dumps(result), datetime.now(timezone.utc).isoformat()))
+        c.execute("COMMIT")
+        return result
+    finally:
+        c.close()
 
 @app.post("/api/expire-sweep")
 def expire_sweep():

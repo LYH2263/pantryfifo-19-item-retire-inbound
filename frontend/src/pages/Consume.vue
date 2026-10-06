@@ -1,7 +1,9 @@
 <template>
   <div>
     <h1>按临期消费</h1>
-    <select v-model.number="item_id"><option v-for="i in items" :value="i.id">{{ i.name }}</option></select>
+    <select v-model.number="item_id">
+      <option v-for="i in items" :value="i.id">{{ i.name }}{{ i.active ? '' : '（已停用）' }}</option>
+    </select>
     <input type="number" v-model.number="qty" />
     <button @click="go">FEFO 扣减</button>
     <pre>{{ result }}</pre>
@@ -14,6 +16,7 @@ const items = ref([])
 const item_id = ref(1)
 const qty = ref(1)
 const result = ref('')
+// 消费下拉列全部品项：停用品的在架余量仍可扣到零
 onMounted(async () => { items.value = await api('/items'); if (items.value[0]) item_id.value = items.value[0].id })
 async function go() {
   try {
