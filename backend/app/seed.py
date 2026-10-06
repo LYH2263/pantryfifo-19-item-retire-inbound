@@ -2,8 +2,12 @@ from app.db import connect
 
 def init_db():
     c = connect()
+    c.execute("PRAGMA journal_mode=WAL")  # persistent file property; set once per database
     c.executescript("""
-    CREATE TABLE IF NOT EXISTS items(id INTEGER PRIMARY KEY, name TEXT, layer TEXT, unit TEXT);
+    CREATE TABLE IF NOT EXISTS items(
+      id INTEGER PRIMARY KEY, name TEXT, layer TEXT, unit TEXT,
+      active INTEGER NOT NULL DEFAULT 1
+    );
     CREATE TABLE IF NOT EXISTS lots(
       id INTEGER PRIMARY KEY AUTOINCREMENT, item_id INT, qty_in REAL, qty_remain REAL,
       expiry TEXT, status TEXT, data_quality TEXT
@@ -11,6 +15,11 @@ def init_db():
     CREATE TABLE IF NOT EXISTS consumptions(id INTEGER PRIMARY KEY AUTOINCREMENT, note TEXT, result_json TEXT, created_at TEXT);
     CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT);
     """)
+    # Migrate pre-active databases in place (docker volume keeps the old file).
+    cols = [r["name"] for r in c.execute("PRAGMA table_info(items)")]
+    if "active" not in cols:
+        c.execute("ALTER TABLE items ADD COLUMN active INTEGER NOT NULL DEFAULT 1")
+    c.commit()  # unconditional: a non-empty legacy DB never reaches the seed branch below
     if c.execute("SELECT COUNT(*) c FROM items").fetchone()["c"] == 0:
         c.executemany("INSERT INTO items(name,layer,unit) VALUES (?,?,?)", [
             ("牛奶", "upper", "盒"), ("鸡蛋", "mid", "个"), ("冻饺", "lower", "袋"),
